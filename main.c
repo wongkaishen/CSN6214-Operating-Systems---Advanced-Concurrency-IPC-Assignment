@@ -24,19 +24,107 @@
 #define DATA_SIZE      (TOTAL_ELEMENTS * sizeof(int32_t))
 #define CHUNK_IO_SIZE  (4 * 1024 * 1024) // 4 MB chunk size for unbuffered I/O loop
 
+// Exclusively create an object we own, then remove its name immediately.
+// Open handles/mappings survive unlink and are inherited by forked children.
+static int create_shared_memory(void) {
+    char name[96];
+    for (unsigned attempt = 0; attempt < 128; attempt++) {
+        int n = snprintf(name, sizeof(name), "%s_%ld_%u", SHM_NAME, (long)getpid(), attempt);
+        if (n < 0 || (size_t)n >= sizeof(name)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd == -1) {
+            if (errno == EEXIST) continue; // Skip stale names without touching their owners.
+            return -1;
+        }
+        if (shm_unlink(name) == -1) {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+        return fd;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+static sem_t *create_completion_semaphore(void) {
+    char name[96];
+    for (unsigned attempt = 0; attempt < 128; attempt++) {
+        int n = snprintf(name, sizeof(name), "%s_%ld_%u", SEM_NAME, (long)getpid(), attempt);
+        if (n < 0 || (size_t)n >= sizeof(name)) {
+            errno = ENAMETOOLONG;
+            return SEM_FAILED;
+        }
+        sem_t *sem = sem_open(name, O_CREAT | O_EXCL, 0600, 0);
+        if (sem == SEM_FAILED) {
+            if (errno == EEXIST) continue;
+            return SEM_FAILED;
+        }
+        if (sem_unlink(name) == -1) {
+            int saved_errno = errno;
+            sem_close(sem);
+            errno = saved_errno;
+            return SEM_FAILED;
+        }
+        return sem;
+    }
+    errno = EEXIST;
+    return SEM_FAILED;
+}
+
 // Structure to define chunk boundaries for workers
 typedef struct {
     int start_idx;
     int end_idx;
 } Chunk;
 
+// Transfer the complete chunk description; a pipe read may return only part of it.
+static int read_chunk(int fd, Chunk *chunk) {
+    size_t received = 0;
+    while (received < sizeof(*chunk)) {
+        ssize_t n = read(fd, (char *)chunk + received, sizeof(*chunk) - received);
+        if (n == -1 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (n == 0) errno = EIO;
+            return -1;
+        }
+        received += (size_t)n;
+    }
+    return 0;
+}
+
+static int write_chunk(int fd, const Chunk *chunk) {
+    size_t sent = 0;
+    while (sent < sizeof(*chunk)) {
+        ssize_t n = write(fd, (const char *)chunk + sent, sizeof(*chunk) - sent);
+        if (n == -1 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (n == 0) errno = EIO;
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
 // Standard merge function to merge two sorted sub-arrays
-static void merge(int32_t *arr, int left, int mid, int right) {
+static int merge(int32_t *arr, int left, int mid, int right) {
     int n1 = mid - left + 1;
     int n2 = right - mid;
 
     int32_t *L = malloc(n1 * sizeof(int32_t));
+    if (!L) return -1;
     int32_t *R = malloc(n2 * sizeof(int32_t));
+    if (!R) {
+        int saved_errno = errno;
+        free(L);
+        errno = saved_errno;
+        return -1;
+    }
 
     for (int i = 0; i < n1; i++) L[i] = arr[left + i];
     for (int j = 0; j < n2; j++) R[j] = arr[mid + 1 + j];
@@ -54,28 +142,40 @@ static void merge(int32_t *arr, int left, int mid, int right) {
 
     free(L);
     free(R);
+    return 0;
 }
 
 // Recursive Merge Sort for worker threads/processes
-void merge_sort(int32_t *arr, int left, int right) {
+int merge_sort(int32_t *arr, int left, int right) {
     if (left < right) {
         int mid = left + (right - left) / 2;
-        merge_sort(arr, left, mid);
-        merge_sort(arr, mid + 1, right);
-        merge(arr, left, mid, right);
+        if (merge_sort(arr, left, mid) == -1 ||
+            merge_sort(arr, mid + 1, right) == -1) return -1;
+        return merge(arr, left, mid, right);
     }
+    return 0;
 }
 
 // Master N-Way Merge function to combine sorted chunks
-void n_way_merge(int32_t *arr, int num_workers, int elements_per_chunk) {
+int n_way_merge(int32_t *arr, int num_workers, int elements_per_chunk) {
     int32_t *temp_merged = malloc(DATA_SIZE);
-    if (!temp_merged) {
-        perror("Failed to allocate memory for merge");
-        exit(EXIT_FAILURE);
-    }
+    if (!temp_merged) return -1;
 
     int *chunk_indices = malloc(num_workers * sizeof(int));
+    if (!chunk_indices) {
+        int saved_errno = errno;
+        free(temp_merged);
+        errno = saved_errno;
+        return -1;
+    }
     int *chunk_ends = malloc(num_workers * sizeof(int));
+    if (!chunk_ends) {
+        int saved_errno = errno;
+        free(chunk_indices);
+        free(temp_merged);
+        errno = saved_errno;
+        return -1;
+    }
 
     for (int i = 0; i < num_workers; i++) {
         chunk_indices[i] = i * elements_per_chunk;
@@ -107,6 +207,7 @@ void n_way_merge(int32_t *arr, int num_workers, int elements_per_chunk) {
     free(temp_merged);
     free(chunk_indices);
     free(chunk_ends);
+    return 0;
 }
 
 // Correctness Verification: O(N) linear scan check
@@ -200,15 +301,25 @@ typedef struct {
     int32_t *array;
     int start_idx;
     int end_idx;
+    int sort_status; // Written by the worker and read by the parent after pthread_join.
 } ThreadArgs;
 
 void *thread_sort_routine(void *arg) {
     ThreadArgs *args = (ThreadArgs *)arg;
-    merge_sort(args->array, args->start_idx, args->end_idx);
+    args->sort_status = merge_sort(args->array, args->start_idx, args->end_idx);
     pthread_exit(NULL);
 }
 
 int main(void) {
+    // A dead pipe reader must produce EPIPE, rather than terminate the parent.
+    struct sigaction pipe_action = {0};
+    pipe_action.sa_handler = SIG_IGN;
+    if (sigemptyset(&pipe_action.sa_mask) == -1 ||
+        sigaction(SIGPIPE, &pipe_action, NULL) == -1) {
+        perror("Failed to ignore SIGPIPE");
+        return EXIT_FAILURE;
+    }
+
     // Seed once so consecutive runs continue the random sequence, even within one second.
     srand((unsigned int)time(NULL));
 
@@ -229,16 +340,15 @@ int main(void) {
             generate_and_write_dataset();
             
             // 1. Setup POSIX Shared Memory
-            int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+            int shm_fd = create_shared_memory();
             if (shm_fd == -1) {
-                perror("Failed to open shared memory");
+                perror("Failed to create shared memory");
                 fclose(csv);
                 return EXIT_FAILURE;
             }
             if (ftruncate(shm_fd, DATA_SIZE) == -1) {
                 perror("Failed to size shared memory");
                 close(shm_fd);
-                shm_unlink(SHM_NAME);
                 fclose(csv);
                 return EXIT_FAILURE;
             }
@@ -246,7 +356,6 @@ int main(void) {
             if (shared_array == MAP_FAILED) {
                 perror("Failed to map shared memory");
                 close(shm_fd);
-                shm_unlink(SHM_NAME);
                 fclose(csv);
                 return EXIT_FAILURE;
             }
@@ -256,17 +365,15 @@ int main(void) {
                 perror("Failed to load complete process dataset");
                 munmap(shared_array, DATA_SIZE);
                 close(shm_fd);
-                shm_unlink(SHM_NAME);
                 fclose(csv);
                 return EXIT_FAILURE;
             }
 
-            sem_t *sem = sem_open(SEM_NAME, O_CREAT | O_RDWR, 0666, 0);
+            sem_t *sem = create_completion_semaphore();
             if (sem == SEM_FAILED) {
-                perror("Failed to open completion semaphore");
+                perror("Failed to create completion semaphore");
                 munmap(shared_array, DATA_SIZE);
                 close(shm_fd);
-                shm_unlink(SHM_NAME);
                 fclose(csv);
                 return EXIT_FAILURE;
             }
@@ -283,10 +390,8 @@ int main(void) {
                         close(pipe_fds[j][1]);
                     }
                     sem_close(sem);
-                    sem_unlink(SEM_NAME);
                     munmap(shared_array, DATA_SIZE);
                     close(shm_fd);
-                    shm_unlink(SHM_NAME);
                     fclose(csv);
                     return EXIT_FAILURE;
                 }
@@ -319,10 +424,8 @@ int main(void) {
                         if (waited == -1) perror("Failed to reap worker process");
                     }
                     sem_close(sem);
-                    sem_unlink(SEM_NAME);
                     munmap(shared_array, DATA_SIZE);
                     close(shm_fd);
-                    shm_unlink(SHM_NAME);
                     fclose(csv);
                     return EXIT_FAILURE;
                 }
@@ -332,32 +435,103 @@ int main(void) {
                         if (j != i) close(pipe_fds[j][0]);
                     }
                     Chunk c;
-                    read(pipe_fds[i][0], &c, sizeof(Chunk));
-                    close(pipe_fds[i][0]);
+                    if (read_chunk(pipe_fds[i][0], &c) == -1) {
+                        perror("Worker failed to receive chunk boundaries");
+                        close(pipe_fds[i][0]);
+                        sem_close(sem);
+                        _exit(EXIT_FAILURE);
+                    }
+                    if (close(pipe_fds[i][0]) == -1) {
+                        perror("Worker failed to close task pipe");
+                        sem_close(sem);
+                        _exit(EXIT_FAILURE);
+                    }
 
-                    merge_sort(shared_array, c.start_idx, c.end_idx);
+                    if (merge_sort(shared_array, c.start_idx, c.end_idx) == -1) {
+                        perror("Worker failed to allocate merge buffers");
+                        sem_close(sem);
+                        _exit(EXIT_FAILURE);
+                    }
 
-                    sem_post(sem);
-                    sem_close(sem);
-                    exit(EXIT_SUCCESS);
+                    if (sem_post(sem) == -1) {
+                        perror("Worker failed to post completion");
+                        sem_close(sem);
+                        _exit(EXIT_FAILURE);
+                    }
+                    if (sem_close(sem) == -1) {
+                        perror("Worker failed to close semaphore");
+                        _exit(EXIT_FAILURE);
+                    }
+                    _exit(EXIT_SUCCESS); // Do not flush the parent's inherited CSV buffer.
                 }
             }
 
+            int workers_ok = 1;
             for (int i = 0; i < num_procs; i++) {
-                close(pipe_fds[i][0]);
+                if (close(pipe_fds[i][0]) == -1) {
+                    perror("Failed to close parent pipe read end");
+                    workers_ok = 0;
+                }
                 Chunk c;
                 c.start_idx = i * elements_per_chunk;
                 c.end_idx = (i == num_procs - 1) ? (TOTAL_ELEMENTS - 1) 
                                                  : ((i + 1) * elements_per_chunk - 1);
-                write(pipe_fds[i][1], &c, sizeof(Chunk));
-                close(pipe_fds[i][1]);
+                if (write_chunk(pipe_fds[i][1], &c) == -1) {
+                    perror("Failed to send worker chunk boundaries");
+                    workers_ok = 0;
+                }
+                // Close even after failure so an incomplete message ends with EOF.
+                if (close(pipe_fds[i][1]) == -1) {
+                    perror("Failed to close parent pipe write end");
+                    workers_ok = 0;
+                }
             }
 
-            for (int i = 0; i < num_procs; i++) sem_wait(sem);
-            for (int i = 0; i < num_procs; i++) waitpid(children[i], NULL, 0);
+            // Reap first: a child that crashes cannot provide a semaphore notification.
+            for (int i = 0; i < num_procs; i++) {
+                int status;
+                pid_t waited;
+                do {
+                    waited = waitpid(children[i], &status, 0);
+                } while (waited == -1 && errno == EINTR);
+                if (waited == -1) {
+                    perror("Failed to wait for worker process");
+                    workers_ok = 0;
+                } else if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
+                    fprintf(stderr, "Worker process %ld did not exit successfully\n",
+                            (long)children[i]);
+                    workers_ok = 0;
+                }
+            }
+
+            // All children have exited; missing notifications must fail, never block.
+            for (int i = 0; workers_ok && i < num_procs; i++) {
+                int rc;
+                do {
+                    rc = sem_trywait(sem);
+                } while (rc == -1 && errno == EINTR);
+                if (rc == -1) {
+                    perror("Failed to collect worker completion");
+                    workers_ok = 0;
+                }
+            }
+            if (!workers_ok) {
+                sem_close(sem);
+                munmap(shared_array, DATA_SIZE);
+                close(shm_fd);
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
 
             // Master N-Way Merge Phase
-            n_way_merge(shared_array, num_procs, elements_per_chunk);
+            if (n_way_merge(shared_array, num_procs, elements_per_chunk) == -1) {
+                perror("Failed to allocate final process merge buffers");
+                sem_close(sem);
+                munmap(shared_array, DATA_SIZE);
+                close(shm_fd);
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
 
             clock_gettime(CLOCK_MONOTONIC, &end);
             double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -370,10 +544,8 @@ int main(void) {
             fprintf(csv, "%d,Process,%d,%.4f\n", run, num_procs, elapsed);
 
             sem_close(sem);
-            sem_unlink(SEM_NAME);
             munmap(shared_array, DATA_SIZE);
             close(shm_fd);
-            shm_unlink(SHM_NAME);
         }
     }
 
@@ -402,6 +574,7 @@ int main(void) {
             ThreadArgs t_args[num_threads];
             int elements_per_chunk = TOTAL_ELEMENTS / num_threads;
             int threads_created = 0;
+            int thread_sorts_ok = 1;
 
             struct timespec start, end;
             clock_gettime(CLOCK_MONOTONIC, &start);
@@ -411,6 +584,7 @@ int main(void) {
                 t_args[i].start_idx = i * elements_per_chunk;
                 t_args[i].end_idx = (i == num_threads - 1) ? (TOTAL_ELEMENTS - 1) 
                                                            : ((i + 1) * elements_per_chunk - 1);
+                t_args[i].sort_status = -1;
                 int rc = pthread_create(&threads[i], NULL, thread_sort_routine, &t_args[i]);
                 if (rc != 0) {
                     errno = rc; // pthread functions return the error code directly.
@@ -429,16 +603,25 @@ int main(void) {
                     // A worker may still access the array: terminate without freeing it.
                     exit(EXIT_FAILURE);
                 }
+                if (t_args[i].sort_status == -1) {
+                    fprintf(stderr, "Worker thread %d failed to allocate merge buffers\n", i);
+                    thread_sorts_ok = 0;
+                }
             }
 
-            if (threads_created != num_threads) {
+            if (threads_created != num_threads || !thread_sorts_ok) {
                 free(thread_array);
                 fclose(csv);
                 return EXIT_FAILURE;
             }
 
             // Master N-Way Merge Phase for Threads
-            n_way_merge(thread_array, num_threads, elements_per_chunk);
+            if (n_way_merge(thread_array, num_threads, elements_per_chunk) == -1) {
+                perror("Failed to allocate final thread merge buffers");
+                free(thread_array);
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
 
             clock_gettime(CLOCK_MONOTONIC, &end);
             double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
