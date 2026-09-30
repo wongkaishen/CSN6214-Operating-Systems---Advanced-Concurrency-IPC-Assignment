@@ -6,6 +6,9 @@
 *.ko
 *.obj
 *.elf
+.vscode/
+.qodo
+
 
 # Linker output
 *.ilk

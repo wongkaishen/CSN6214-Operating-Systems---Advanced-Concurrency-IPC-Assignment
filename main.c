@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
+#include <signal.h>
 
 // Configuration Constants
 #define SHM_NAME       "/parallel_sort_shm"
@@ -87,7 +89,8 @@ void n_way_merge(int32_t *arr, int num_workers, int elements_per_chunk) {
 
         for (int i = 0; i < num_workers; i++) {
             if (chunk_indices[i] <= chunk_ends[i]) {
-                if (arr[chunk_indices[i]] < min_val) {
+                // Select the first available chunk even when its value is INT32_MAX.
+                if (min_chunk == -1 || arr[chunk_indices[i]] < min_val) {
                     min_val = arr[chunk_indices[i]];
                     min_chunk = i;
                 }
@@ -125,9 +128,13 @@ void generate_and_write_dataset(void) {
     }
 
     int32_t *chunk_buffer = malloc(CHUNK_IO_SIZE);
+    if (!chunk_buffer) {
+        perror("Failed to allocate dataset buffer");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
     size_t total_bytes_written = 0;
 
-    srand((unsigned int)time(NULL));
     while (total_bytes_written < DATA_SIZE) {
         size_t bytes_to_write = CHUNK_IO_SIZE;
         if (DATA_SIZE - total_bytes_written < CHUNK_IO_SIZE) {
@@ -138,18 +145,54 @@ void generate_and_write_dataset(void) {
             chunk_buffer[i] = (int32_t)(rand() % 1000000);
         }
 
-        ssize_t written = write(fd, chunk_buffer, bytes_to_write);
-        if (written == -1) {
-            perror("Write system call failed");
-            free(chunk_buffer);
-            close(fd);
-            exit(EXIT_FAILURE);
+        // Finish this buffer before generating new values, even after a short write.
+        size_t chunk_written = 0;
+        while (chunk_written < bytes_to_write) {
+            ssize_t written = write(fd, (char *)chunk_buffer + chunk_written,
+                                    bytes_to_write - chunk_written);
+            if (written == -1 && errno == EINTR) continue;
+            if (written <= 0) {
+                if (written == 0) errno = EIO; // No progress: avoid an infinite loop.
+                perror("Write system call failed");
+                free(chunk_buffer);
+                close(fd);
+                exit(EXIT_FAILURE);
+            }
+            chunk_written += (size_t)written;
         }
-        total_bytes_written += written;
+        total_bytes_written += bytes_to_write;
     }
 
     free(chunk_buffer);
-    close(fd);
+    if (close(fd) == -1) {
+        perror("Failed to close dataset after writing");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Return success only after the entire dataset is loaded and the file is closed.
+static int load_dataset(int32_t *array) {
+    int fd = open(DATA_FILE, O_RDONLY);
+    if (fd == -1) return -1;
+
+    size_t total_read = 0;
+    while (total_read < DATA_SIZE) {
+        size_t to_read = DATA_SIZE - total_read;
+        if (to_read > CHUNK_IO_SIZE) to_read = CHUNK_IO_SIZE;
+
+        ssize_t r = read(fd, (char *)array + total_read, to_read);
+        if (r == -1 && errno == EINTR) continue;
+        if (r <= 0) {
+            // EOF before DATA_SIZE is an incomplete dataset, not a successful load.
+            int saved_errno = (r == 0) ? EIO : errno;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+        total_read += (size_t)r;
+    }
+
+    return close(fd);
 }
 
 // Thread argument structure for pthread implementation
@@ -166,8 +209,8 @@ void *thread_sort_routine(void *arg) {
 }
 
 int main(void) {
-    printf("[Init] Generating dataset via unbuffered system calls (open/write)...\n");
-    generate_and_write_dataset();
+    // Seed once so consecutive runs continue the random sequence, even within one second.
+    srand((unsigned int)time(NULL));
 
     // Open CSV file for recording benchmarks
     FILE *csv = fopen(CSV_FILE, "w");
@@ -182,30 +225,72 @@ int main(void) {
     // ==========================================
     for (int num_procs = 1; num_procs <= 10; num_procs++) {
         for (int run = 1; run <= 3; run++) {
+            printf("[Process Run %d] Workers: %d | Generating fresh dataset...\n", run, num_procs);
+            generate_and_write_dataset();
             
             // 1. Setup POSIX Shared Memory
             int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-            ftruncate(shm_fd, DATA_SIZE);
+            if (shm_fd == -1) {
+                perror("Failed to open shared memory");
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
+            if (ftruncate(shm_fd, DATA_SIZE) == -1) {
+                perror("Failed to size shared memory");
+                close(shm_fd);
+                shm_unlink(SHM_NAME);
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
             int32_t *shared_array = mmap(NULL, DATA_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+            if (shared_array == MAP_FAILED) {
+                perror("Failed to map shared memory");
+                close(shm_fd);
+                shm_unlink(SHM_NAME);
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
 
             // 2. Load Data from disk to Shared Memory using unbuffered read() chunk loop
-            int file_fd = open(DATA_FILE, O_RDONLY);
-            size_t total_read = 0;
-            while (total_read < DATA_SIZE) {
-                size_t to_read = CHUNK_IO_SIZE;
-                if (DATA_SIZE - total_read < CHUNK_IO_SIZE) to_read = DATA_SIZE - total_read;
-                ssize_t r = read(file_fd, ((char *)shared_array) + total_read, to_read);
-                if (r <= 0) break;
-                total_read += r;
+            if (load_dataset(shared_array) == -1) {
+                perror("Failed to load complete process dataset");
+                munmap(shared_array, DATA_SIZE);
+                close(shm_fd);
+                shm_unlink(SHM_NAME);
+                fclose(csv);
+                return EXIT_FAILURE;
             }
-            close(file_fd);
 
             sem_t *sem = sem_open(SEM_NAME, O_CREAT | O_RDWR, 0666, 0);
+            if (sem == SEM_FAILED) {
+                perror("Failed to open completion semaphore");
+                munmap(shared_array, DATA_SIZE);
+                close(shm_fd);
+                shm_unlink(SHM_NAME);
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
             int pipe_fds[num_procs][2];
             pid_t children[num_procs];
             int elements_per_chunk = TOTAL_ELEMENTS / num_procs;
 
-            for (int i = 0; i < num_procs; i++) pipe(pipe_fds[i]);
+            for (int i = 0; i < num_procs; i++) {
+                if (pipe(pipe_fds[i]) == -1) {
+                    perror("Failed to create worker pipe");
+                    // Only earlier pipes have valid descriptors; no children exist yet.
+                    for (int j = 0; j < i; j++) {
+                        close(pipe_fds[j][0]);
+                        close(pipe_fds[j][1]);
+                    }
+                    sem_close(sem);
+                    sem_unlink(SEM_NAME);
+                    munmap(shared_array, DATA_SIZE);
+                    close(shm_fd);
+                    shm_unlink(SHM_NAME);
+                    fclose(csv);
+                    return EXIT_FAILURE;
+                }
+            }
 
             // Start Clock Timer (excluding file load time)
             struct timespec start, end;
@@ -213,6 +298,34 @@ int main(void) {
 
             for (int i = 0; i < num_procs; i++) {
                 children[i] = fork();
+                if (children[i] == -1) {
+                    perror("Failed to fork worker process");
+                    // Earlier children may be blocked reading their chunk boundaries.
+                    // Terminate only successfully created children, then reap them.
+                    for (int j = 0; j < i; j++) {
+                        if (kill(children[j], SIGKILL) == -1 && errno != ESRCH) {
+                            perror("Failed to terminate worker process");
+                        }
+                    }
+                    for (int j = 0; j < num_procs; j++) {
+                        close(pipe_fds[j][0]);
+                        close(pipe_fds[j][1]);
+                    }
+                    for (int j = 0; j < i; j++) {
+                        pid_t waited;
+                        do {
+                            waited = waitpid(children[j], NULL, 0);
+                        } while (waited == -1 && errno == EINTR);
+                        if (waited == -1) perror("Failed to reap worker process");
+                    }
+                    sem_close(sem);
+                    sem_unlink(SEM_NAME);
+                    munmap(shared_array, DATA_SIZE);
+                    close(shm_fd);
+                    shm_unlink(SHM_NAME);
+                    fclose(csv);
+                    return EXIT_FAILURE;
+                }
                 if (children[i] == 0) {
                     for (int j = 0; j < num_procs; j++) {
                         close(pipe_fds[j][1]);
@@ -269,22 +382,26 @@ int main(void) {
     // ==========================================
     for (int num_threads = 1; num_threads <= 10; num_threads++) {
         for (int run = 1; run <= 3; run++) {
+            printf("[Thread Run %d] Workers: %d | Generating fresh dataset...\n", run, num_threads);
+            generate_and_write_dataset();
             
             int32_t *thread_array = malloc(DATA_SIZE);
-            int file_fd = open(DATA_FILE, O_RDONLY);
-            size_t total_read = 0;
-            while (total_read < DATA_SIZE) {
-                size_t to_read = CHUNK_IO_SIZE;
-                if (DATA_SIZE - total_read < CHUNK_IO_SIZE) to_read = DATA_SIZE - total_read;
-                ssize_t r = read(file_fd, ((char *)thread_array) + total_read, to_read);
-                if (r <= 0) break;
-                total_read += r;
+            if (!thread_array) {
+                perror("Failed to allocate thread dataset");
+                fclose(csv);
+                return EXIT_FAILURE;
             }
-            close(file_fd);
+            if (load_dataset(thread_array) == -1) {
+                perror("Failed to load complete thread dataset");
+                free(thread_array);
+                fclose(csv);
+                return EXIT_FAILURE;
+            }
 
             pthread_t threads[num_threads];
             ThreadArgs t_args[num_threads];
             int elements_per_chunk = TOTAL_ELEMENTS / num_threads;
+            int threads_created = 0;
 
             struct timespec start, end;
             clock_gettime(CLOCK_MONOTONIC, &start);
@@ -294,11 +411,30 @@ int main(void) {
                 t_args[i].start_idx = i * elements_per_chunk;
                 t_args[i].end_idx = (i == num_threads - 1) ? (TOTAL_ELEMENTS - 1) 
                                                            : ((i + 1) * elements_per_chunk - 1);
-                pthread_create(&threads[i], NULL, thread_sort_routine, &t_args[i]);
+                int rc = pthread_create(&threads[i], NULL, thread_sort_routine, &t_args[i]);
+                if (rc != 0) {
+                    errno = rc; // pthread functions return the error code directly.
+                    perror("Failed to create worker thread");
+                    break;
+                }
+                threads_created++;
             }
 
-            for (int i = 0; i < num_threads; i++) {
-                pthread_join(threads[i], NULL);
+            for (int i = 0; i < threads_created; i++) {
+                int rc = pthread_join(threads[i], NULL);
+                if (rc != 0) {
+                    errno = rc;
+                    perror("Failed to join worker thread");
+                    fclose(csv);
+                    // A worker may still access the array: terminate without freeing it.
+                    exit(EXIT_FAILURE);
+                }
+            }
+
+            if (threads_created != num_threads) {
+                free(thread_array);
+                fclose(csv);
+                return EXIT_FAILURE;
             }
 
             // Master N-Way Merge Phase for Threads
