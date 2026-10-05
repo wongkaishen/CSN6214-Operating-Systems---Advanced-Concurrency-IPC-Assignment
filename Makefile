@@ -1,14 +1,16 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -pthread -D_FILE_OFFSET_BITS=64
-LDFLAGS = -lrt -pthread
+CFLAGS = -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
+LIBS = -pthread -lrt
+TARGET = parallel_sort
+SRC = parallel_sort.c
 
-all: parallel_merge_sort
+all: $(TARGET)
 
-parallel_merge_sort: main.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(SRC)$(CC) $(CFLAGS)$(SRC) -o $(TARGET)$(LIBS)
 
-run: parallel_merge_sort
-	./parallel_merge_sort
+run: $(TARGET)
+	./$(TARGET)
 
 clean:
-	rm -f parallel_merge_sort *.o dataset.bin raw_data.csv
+	rm -f $(TARGET) dataset.bin raw_data.csv
+	rm -f /dev/shm/parallel_sort_shm /dev/shm/sem.parallel_sort_sem
